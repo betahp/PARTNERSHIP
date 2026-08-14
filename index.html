@@ -886,6 +886,11 @@
 </head>
 <body style="background-color:#9d8f6f;">
 
+  <div id="storageBanner" style="display:none; position:fixed; top:0; left:0; right:0; z-index:998; background:#7a3b2e; color:#fdfaf3; font-family:'Inter',sans-serif; font-size:0.8rem; padding:0.8rem 1rem; align-items:center; justify-content:space-between; gap:0.8rem; flex-wrap:wrap;">
+    <span>⚠️ Storage is almost full. Download a backup now to avoid losing anything.</span>
+    <button id="downloadBackupBtnBanner" style="background:#fdfaf3; color:#7a3b2e; border:none; padding:0.5rem 1rem; font-family:'Inter',sans-serif; font-weight:600; font-size:0.75rem; cursor:pointer; white-space:nowrap;">Download Backup</button>
+  </div>
+
   <!-- CAPA -->
   <section class="cover">
     <div class="corner-art tr" id="cornerTR"></div>
@@ -1095,7 +1100,15 @@
     </div>
   </section>
 
-  <div class="footer-note">Prototype — cover, timeline, letters and documents structure</div>
+  <div class="footer-note">
+    Prototype — cover, timeline, letters and documents structure
+    <br>
+    <button id="manualSaveBtn" style="margin-top:1.2rem; background:var(--gold-soft); border:none; color:var(--taupe-deep); padding:0.75rem 1.8rem; font-family:'Inter',sans-serif; font-weight:600; font-size:0.75rem; letter-spacing:0.12em; text-transform:uppercase; cursor:pointer;">💾 Save Now</button>
+    <div id="saveStatusLabel" style="margin-top:0.7rem; font-size:0.72rem; min-height:1.2em;"></div>
+    <br>
+    <button id="downloadBackupBtnFooter" style="margin-top:0.9rem; background:transparent; border:1px solid rgba(244,238,224,0.4); color:var(--cream-dim); padding:0.55rem 1.1rem; font-family:'Inter',sans-serif; font-size:0.68rem; letter-spacing:0.1em; text-transform:uppercase; cursor:pointer;">⬇ Download Full Backup</button>
+    <div style="margin-top:0.6rem; font-size:0.62rem; opacity:0.6;" id="storageUsageLabel"></div>
+  </div>
 
 <script>
   // ---- Dente-de-leão (dandelion) line-art, gerado em SVG ----
@@ -1191,14 +1204,107 @@
   const messagesRow = document.getElementById('messagesRow');
   const photosRow = document.getElementById('photosRow');
 
-  // ---- persistent storage (saved in this browser) ----
+  // ---- persistent storage (IndexedDB as primary — much larger capacity than localStorage,
+  // which was silently failing to save once photos filled up its ~5MB limit) ----
   const STORAGE_KEY = 'nossaHistoriaData_v1';
+  const IDB_NAME = 'nossaHistoriaDB';
+  const IDB_STORE = 'appDataStore';
+  const IDB_KEY = 'main';
+  const STORAGE_SOFT_LIMIT_BYTES = 4.5 * 1024 * 1024; // still used to size the localStorage fallback warning
+
   let appData = {};
-  try { appData = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch(e){ appData = {}; }
+
+  function openIDB(){
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => { req.result.createObjectStore(IDB_STORE); };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbGet(){
+    try {
+      const db = await openIDB();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    } catch(e){ console.warn('IndexedDB read failed', e); return undefined; }
+  }
+
+  async function idbSet(value){
+    try {
+      const db = await openIDB();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const req = tx.objectStore(IDB_STORE).put(value, IDB_KEY);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    } catch(e){ console.warn('IndexedDB write failed', e); }
+  }
+
+  async function loadAppData(){
+    let fromIDB = null;
+    try { fromIDB = await idbGet(); } catch(e){ console.warn('IDB load failed', e); fromIDB = null; }
+
+    let fromLocal = {};
+    try { fromLocal = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch(e){ fromLocal = {}; }
+
+    const idbStr = fromIDB ? JSON.stringify(fromIDB) : '';
+    const localStr = JSON.stringify(fromLocal);
+
+    // Never trust IndexedDB just because it exists — an empty {} there would otherwise
+    // silently hide real data still sitting in localStorage. Always use whichever
+    // source actually has more content.
+    let result;
+    if(idbStr.length > localStr.length){
+      result = fromIDB;
+    } else {
+      result = fromLocal;
+    }
+    idbSet(result); // heal IndexedDB so it matches whichever source won
+    return result;
+  }
+
+  function currentStorageBytes(){
+    try { return new Blob([JSON.stringify(appData)]).size; } catch(e){ return 0; }
+  }
 
   function saveData(){
+    // IndexedDB is the real, large-capacity save — this is what protects your data now.
+    idbSet(appData);
+    // best-effort mirror to localStorage too, but never let its small ~5MB limit block anything
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); }
-    catch(e){ console.warn('Could not save (storage full?)', e); }
+    catch(e){ /* expected once photos are large — IndexedDB above already has it safely */ }
+    updateStorageLabel();
+  }
+
+  function updateStorageLabel(){
+    const label = document.getElementById('storageUsageLabel');
+    if(!label) return;
+    const bytes = currentStorageBytes();
+    const mb = (bytes / (1024*1024)).toFixed(2);
+    label.textContent = `${mb} MB used in this browser`;
+  }
+
+  function checkStorageWarning(){
+    const bytes = currentStorageBytes();
+    const bigLimit = 200 * 1024 * 1024; // IndexedDB has far more room, but still worth a nudge to back up periodically
+    if(bytes > bigLimit){
+      showStorageBanner(true);
+    } else {
+      showStorageBanner(false);
+    }
+  }
+
+  function showStorageBanner(show){
+    const banner = document.getElementById('storageBanner');
+    if(!banner) return;
+    banner.style.display = show ? 'flex' : 'none';
   }
 
   function getMonthData(month){
@@ -1270,9 +1376,10 @@
 
     // messages
     messagesRow.innerHTML = '';
-    data.messages.forEach((msg) => {
+    data.messages.forEach((msg, msgIdx) => {
       const card = document.createElement('div');
       card.className = 'message-card';
+      const dlName = `${currentMonth.replace(' ','-')}_message-${msgIdx+1}`;
 
       const shot = document.createElement('div');
       shot.className = 'placeholder-shot' + (msg.img ? ' has-image' : '');
@@ -1299,7 +1406,7 @@
           openLightbox(msg.img, {
             onReplace: () => triggerUpload(dataUrl => {
               msg.img = dataUrl; saveData(); renderMonth(currentMonth); closeLightbox();
-            }),
+            }, 'image/*', dlName),
             onDelete: () => { msg.img = null; saveData(); renderMonth(currentMonth); }
           });
         } else {
@@ -1307,7 +1414,7 @@
             msg.img = dataUrl;
             saveData();
             renderMonth(currentMonth);
-          });
+          }, 'image/*', dlName);
         }
       });
 
@@ -1369,11 +1476,12 @@
       });
       t.appendChild(slotDel);
       t.addEventListener('click', () => {
+        const dlName = `${currentMonth.replace(' ','-')}_photo-${idx+1}`;
         if(photo){
           openLightbox(photo, {
             onReplace: () => triggerUpload(dataUrl => {
               data.photos[idx] = dataUrl; saveData(); renderMonth(currentMonth); closeLightbox();
-            }),
+            }, 'image/*', dlName),
             onDelete: () => { data.photos[idx] = null; saveData(); renderMonth(currentMonth); }
           });
         } else {
@@ -1381,7 +1489,7 @@
             data.photos[idx] = dataUrl;
             saveData();
             renderMonth(currentMonth);
-          });
+          }, 'image/*', dlName);
         }
       });
       photosRow.appendChild(t);
@@ -1393,6 +1501,12 @@
     const [m,y] = short.split(' ');
     return (map[m]||m) + ' ' + y;
   }
+
+  // Everything below only runs after appData has been fully loaded
+  // from IndexedDB (or migrated from localStorage), so nothing renders
+  // with stale/empty data.
+  (async () => {
+  appData = await loadAppData();
 
   months.forEach((m, i) => {
     const el = document.createElement('div');
@@ -1420,7 +1534,7 @@
           appData.files[key] = {data:dataUrl, name:file.name, type:file.type};
           saveData();
           applyFileToLetterSlot(el, appData.files[key]);
-        }, 'image/*,application/pdf');
+        }, 'image/*,application/pdf', key);
       });
     });
 
@@ -1434,7 +1548,7 @@
           appData.files[key] = {data:dataUrl, name:file.name, type:file.type};
           saveData();
           applyFileToDocCard(card, appData.files[key]);
-        }, 'image/*,application/pdf');
+        }, 'image/*,application/pdf', key);
       });
     });
   }
@@ -1494,7 +1608,7 @@
   }
 
   // update triggerUpload to also pass the raw File and accept a custom file type
-  function triggerUpload(onLoaded, accept){
+  function triggerUpload(onLoaded, accept, downloadName){
     fileInput.accept = accept || 'image/*';
     fileInput.onchange = () => {
       const file = fileInput.files[0];
@@ -1507,6 +1621,62 @@
   }
 
   loadFileSlots();
+
+  // ---- full backup download (everything, saved as a real file on the phone) ----
+  function downloadFullBackup(){
+    const blob = new Blob([JSON.stringify(appData, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const today = new Date().toISOString().slice(0,10);
+    a.href = url;
+    a.download = `partnership-backup-${today}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+  const bannerBtn = document.getElementById('downloadBackupBtnBanner');
+  const footerBtn = document.getElementById('downloadBackupBtnFooter');
+  if(bannerBtn) bannerBtn.addEventListener('click', downloadFullBackup);
+  if(footerBtn) footerBtn.addEventListener('click', downloadFullBackup);
+
+  // ---- "Save Now" button: saves, then reads back from IndexedDB to CONFIRM it actually worked ----
+  const manualSaveBtn = document.getElementById('manualSaveBtn');
+  const saveStatusLabel = document.getElementById('saveStatusLabel');
+  if(manualSaveBtn){
+    manualSaveBtn.addEventListener('click', async () => {
+      manualSaveBtn.disabled = true;
+      manualSaveBtn.textContent = 'Saving…';
+      saveStatusLabel.textContent = '';
+      saveStatusLabel.style.color = '';
+
+      saveData(); // writes to IndexedDB + localStorage mirror
+
+      // give the write a brief moment, then read it back to verify it truly landed
+      await new Promise(r => setTimeout(r, 300));
+      let verified = false;
+      try {
+        const readBack = await idbGet();
+        verified = readBack && JSON.stringify(readBack) === JSON.stringify(appData);
+      } catch(e){ verified = false; }
+
+      manualSaveBtn.disabled = false;
+      manualSaveBtn.textContent = '💾 Save Now';
+
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+      if(verified){
+        saveStatusLabel.style.color = '#9fd88a';
+        saveStatusLabel.textContent = `✓ Saved successfully at ${timeStr}`;
+      } else {
+        saveStatusLabel.style.color = '#e08a7a';
+        saveStatusLabel.textContent = `⚠ Save could not be confirmed — please tap "Download Full Backup" now to be safe.`;
+      }
+    });
+  }
+
+  updateStorageLabel();
+  checkStorageWarning();
 
   // ---- remove personal note (persisted) ----
   const personalNote = document.getElementById('adamPersonalNote');
@@ -1579,7 +1749,7 @@
         icon.textContent = '✓';
         status.textContent = file.name;
         card.classList.add('has-file');
-      }, 'image/*,application/pdf');
+      }, 'image/*,application/pdf', entry.name || 'custom-document');
     });
 
     return card;
@@ -1599,6 +1769,8 @@
     nameEl.focus();
     document.getSelection().selectAllChildren(nameEl);
   });
+
+  })(); // end of async boot — appData is now guaranteed loaded before any of the above ran
 </script>
 
 </body>
